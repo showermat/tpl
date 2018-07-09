@@ -1,0 +1,10 @@
+[package]
+name = "tpl"
+version = "0.1.0"
+authors = ["Matthew Schauer"]
+
+[dependencies]
+nom = "^4.0"
+yaml-rust = "0.3.5"
+clap = "2.32.0"
+error-chain = "0.12.0"
