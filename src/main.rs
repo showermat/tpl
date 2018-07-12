@@ -11,8 +11,11 @@ use yaml_rust::Yaml;
 mod errors { error_chain!{} }
 use errors::*;
 
-// https://stackoverflow.com/questions/46876879/how-do-i-create-a-streaming-parser-in-nom
 // https://mustache.github.io/mustache.5.html
+
+// TODO
+// https://stackoverflow.com/questions/46876879/how-do-i-create-a-streaming-parser-in-nom
+// Allow comments to contain {{ and }} -- that is, do the nesting calculation for them as well
 
 #[derive(Debug, PartialEq)]
 pub enum Token {
@@ -27,7 +30,7 @@ pub enum Token {
 
 named!(yaml_path<&str, Vec<String>>,
 	do_parse!(
-		path: ws!(pair!(opt!(char!('.')), separated_list!(char!('.'), ws!(nom::alpha)))) >>
+		path: ws!(pair!(opt!(char!('.')), separated_list!(char!('.'), ws!(nom::alphanumeric)))) >> // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
 		({ let mut ret = path.1.iter().map(|x| x.to_string()).collect::<Vec<String>>(); if path.0.is_some() { ret.insert(0, "".to_string()); ret } else { ret } })
 	)
 );
@@ -54,18 +57,52 @@ named!(template_literal<&str, Token>,
 	)
 );
 
-named!(document<&str, Vec<Token>>,
-	many0!(
-		alt!(complete!(template_sub) | complete!(template_literal))
+named!(yaml_block<&str, Vec<Yaml>>,
+	do_parse!(
+		tag_s!("---\n") >>
+		block: take_until_and_consume!("\n...\n") >>
+		(yaml_rust::YamlLoader::load_from_str(&block).expect("Failed to parse YAML block")) // FIXME Use chain_err and return a result here rather than expecting
 	)
 );
 
+named!(document<&str, (Option<Vec<Yaml>>, Vec<Token>)>,
+	tuple!(
+		opt!(yaml_block),
+		many0!(
+			alt!(complete!(template_sub) | complete!(template_literal))
+		)
+	)
+);
+
+fn read_file(path: &str) -> Result<String> {
+	let mut ret = String::new();
+	BufReader::new(File::open(path).chain_err(|| format!("Failed to open {}", path))?)
+		.read_to_string(&mut ret).chain_err(|| format!("Failed to read from {}", path))?;
+	Ok(ret)
+}
+
+fn yaml_pathjoin<'a>(paths: &Vec<Vec<&'a str>>) -> Vec<&'a str> {
+	let mut ret = vec![];
+	for elem in paths.iter().flat_map(|x| x.iter()) {
+		if *elem == "" { ret.clear(); }
+		else { ret.push(*elem); }
+	}
+	ret
+}
+
 fn yaml_get<'a>(yaml: &'a Yaml, context: &Vec<Vec<&str>>, path: &Vec<&str>) -> &'a Yaml { // TODO For these functions, should I be using &[&str], &Vec<&str>, &Vec<String>, ...?
 	let mut cur = yaml;
-	for elem in context.iter().flat_map(|x| x.iter()).chain(path.iter()) {
+	for elem in yaml_pathjoin(context).iter().chain(path.iter()) {
 		cur = if *elem == "" { yaml } else { &cur[*elem] }
 	}
 	cur
+}
+
+fn yaml_bool(yaml: &Yaml) -> bool {
+	match yaml {
+		Yaml::BadValue | Yaml::Null | Yaml::Boolean(false) => false, // Should we also interpret 0, 0.0, and "" as falsy?
+		_ => true,
+	}
 }
 
 fn yaml_string(yaml: &Yaml) -> Result<String> {
@@ -75,53 +112,59 @@ fn yaml_string(yaml: &Yaml) -> Result<String> {
 		Yaml::String(x) => Ok(x.to_string()),
 		Yaml::Boolean(x) => Ok(x.to_string()),
 		Yaml::Null => Ok("".to_string()),
-		_ => bail!("Can't stringify type"),
+		_ => Err(Error::from("Can't stringify type")), // TODO This error message (and a lot of others) needs to be better
 	}
+}
+
+#[derive(Debug)]
+struct Frame {
+	path: Vec<String>,
+	echo: bool,
+	loop_start: Option<usize>,
+	loop_idx: usize,
 }
 
 fn run() -> Result<()> {
 	let args = clap_app!(tpl =>
 		(about: "Simple multi-purpose template engine")
 		(@arg input: * index(1) "File to be templated")
-		(@arg values: * index(2) "YAML file of template values")
+		(@arg values: -f [file] "YAML file of template values")
 	).get_matches();
 
-	let mut input = String::new();
-	BufReader::new(File::open(args.value_of("input").unwrap()).chain_err(|| "Failed to open input file")?)
-		.read_to_string(&mut input).chain_err(|| "Failed to read from input file")?;
+	let input = read_file(args.value_of("input").unwrap()).chain_err(|| "Failed to get input")?;
 	let template = document(&input).expect("Failed to parse template"); // FIXME Why doesn't the borrow checker like this? .chain_err(|| "Failed to parse template")?;
-	let mut tokens = template.1;
+	let mut tokens = (template.1).1;
+	let yaml = (template.1).0;
 	tokens.push(Token::Literal(template.0.to_string())); // FIXME This hack will go away when I figure out how to make Nom parse all input
-	//println!("{:?}", tokens);
+	let values: Vec<Yaml> = args.value_of("values")
+		.map(|fname| yaml_rust::YamlLoader::load_from_str(&read_file(fname).expect("Failed to read values file")).expect("Failed to parse values file")) // FIXME Replace expects with chain_errs -- tricky inside closures
+		.or_else(|| yaml)
+		.ok_or(Error::from("Values are required either inline in the input or using the values flag"))?;
+	let values = &values[0]; // TODO What should we do if there are multiple streams in the file?  Ignore them?
 
-	let mut yamlin = String::new();
-	BufReader::new(File::open(args.value_of("values").unwrap()).chain_err(|| "Failed to open values file")?)
-		.read_to_string(&mut yamlin).chain_err(|| "Failed to read from values file")?;
-	let values = &yaml_rust::YamlLoader::load_from_str(&yamlin).chain_err(|| "Failed to parse values file")?[0]; // TODO What should we do if there are multiple streams in the file?  Ignore them?
-
-	let mut context: Vec<Vec<String>> = vec![];
-	let mut echo_enable = vec![];
-
-	for token in tokens {
-		//println!("\x1b[31m{:?} {:?} {:?}\x1b[m", token, context, echo_enable);
-		let out: Result<String> = match token {
-			Token::Literal(s) => Ok(s),
+	let mut stack: Vec<Frame> = vec![];
+	let mut idx = 0;
+	while idx < tokens.len() {
+		//println!("\x1b[31m{:?} {:?}\x1b[m", token, stack);
+		let out: Result<String> = match &tokens[idx] {
+			Token::Literal(s) => Ok(s.to_string()),
 			Token::Comment(_) => Ok("".to_string()),
-			Token::DirectSub(ref path) => yaml_string(yaml_get(values, &context.iter().map(|x| x.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect())), // TODO Abstract the ugly map to a function or something to minimize repeated code
+			Token::DirectSub(ref path) => yaml_string(yaml_get(values, &stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect())), // TODO Abstract the ugly map to a function or something to minimize repeated code
 			Token::CondSub(ref path) => {
-				echo_enable.push(!yaml_get(values, &context.iter().map(|x| x.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect()).is_badvalue());
-				context.push(path.to_vec()); // TODO Can I do it without the redundan conversion?
+				let echo = yaml_bool(yaml_get(values, &stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect()));
+				stack.push(Frame { path: path.to_vec(), echo: echo, loop_start: None, loop_idx: 0 });
 				Ok("".to_string())
 			},
 			Token::InvSub(ref path) => {
-				echo_enable.push(yaml_get(values, &context.iter().map(|x| x.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect()).is_badvalue());
-				context.push(path.to_vec());
+				let echo = !yaml_bool(yaml_get(values, &stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect()));
+				stack.push(Frame { path: path.to_vec(), echo: echo, loop_start: None, loop_idx: 0 });
 				Ok("".to_string())
 			},
-			Token::EndSub => { echo_enable.pop(); context.pop(); Ok("".to_string()) },
-			Token::KeySub(n) => Ok(n.to_string()), // TODO context.iter().rev().nth(n as usize).map(|x| x.to_string()).ok_or(Error::from("Key level too high")),
+			Token::EndSub => { stack.pop(); Ok("".to_string()) },
+			Token::KeySub(n) => Ok(yaml_pathjoin(&stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>()).iter().rev().nth(*n as usize).map(|x| x.to_string()).ok_or(Error::from("Key level too high"))?),
 		};
-		print!("{}", if echo_enable.iter().all(|x| *x) { out } else { Ok("".to_string()) }.chain_err(|| "Failed to template value")?);
+		print!("{}", if stack.iter().all(|x| x.echo) { out } else { Ok("".to_string()) }.chain_err(|| "Failed to template value")?);
+		idx += 1;
 	}
 	Ok(())
 }
