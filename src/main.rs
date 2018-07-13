@@ -16,24 +16,39 @@ use errors::*;
 // TODO
 // https://stackoverflow.com/questions/46876879/how-do-i-create-a-streaming-parser-in-nom
 // Allow comments to contain {{ and }} -- that is, do the nesting calculation for them as well
+// Error if there are unmatched conds (missing {{/}}s) rather than implicitly closing them at the end
+// User-friendly errors on template parsing failures
+// By default, print nothing if a variable cannot be found, but allow it to be configured to error
+// Allow text to be included after the / in EndSub.  Either ignore it or require it to match the start text
+// Options to collapse whitespace?
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum YamlPathElem {
+	DownObject(String), // TODO Theoretically, we should support objects with keys other than strings
+	DownArray(i64),
+	Up,
+	Key,
+	Root
+}
+
+named!(yaml_path<&str, YamlPath>,
+	do_parse!(
+		path: ws!(pair!(opt!(char!('.')), separated_list!(char!('.'), ws!(nom::alphanumeric)))) >> // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
+		({ let mut ret = path.1.iter().map(|x| YamlPathElem::DownObject(x.to_string())).collect::<Vec<YamlPathElem>>(); if path.0.is_some() { ret.insert(0, YamlPathElem::Root); } ret  })
+	)
+);
+
+type YamlPath = Vec<YamlPathElem>;
 
 #[derive(Debug, PartialEq)]
 pub enum Token {
 	Literal(String),
-	DirectSub(Vec<String>),
-	CondSub(Vec<String>),
-	InvSub(Vec<String>),
+	DirectSub(YamlPath),
+	CondSub(YamlPath),
+	InvSub(YamlPath),
 	EndSub,
-	KeySub(i64),
 	Comment(String),
 }
-
-named!(yaml_path<&str, Vec<String>>,
-	do_parse!(
-		path: ws!(pair!(opt!(char!('.')), separated_list!(char!('.'), ws!(nom::alphanumeric)))) >> // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
-		({ let mut ret = path.1.iter().map(|x| x.to_string()).collect::<Vec<String>>(); if path.0.is_some() { ret.insert(0, "".to_string()); ret } else { ret } })
-	)
-);
 
 named!(template_sub<&str, Token>,
 	delimited!(
@@ -43,7 +58,6 @@ named!(template_sub<&str, Token>,
 			Some('#') => do_parse!(path: yaml_path >> (Token::CondSub(path))) |
 			Some('^') => do_parse!(path: yaml_path >> (Token::InvSub(path))) |
 			Some('/') => do_parse!((Token::EndSub)) | // FIXME How do I return Token::EndSub without this pointless do_parse?
-			Some('?') => do_parse!(n: ws!(opt!(nom::digit)) >> (Token::KeySub(n.map(|x| x.parse::<i64>().expect("Not an integer")).unwrap_or(0)))) | // TODO I think I can do the conversion automatically with parse_to
 			Some('!') => do_parse!(text: take_until!("}}") >> (Token::Comment(text.to_string())))
 		),
 		tag_s!("}}")
@@ -81,26 +95,45 @@ fn read_file(path: &str) -> Result<String> {
 	Ok(ret)
 }
 
-fn yaml_pathjoin<'a>(paths: &Vec<Vec<&'a str>>) -> Vec<&'a str> {
+fn yaml_pathjoin<'a>(paths: &[&YamlPath]) -> YamlPath {
 	let mut ret = vec![];
 	for elem in paths.iter().flat_map(|x| x.iter()) {
-		if *elem == "" { ret.clear(); }
-		else { ret.push(*elem); }
+		match elem {
+			YamlPathElem::Up => { ret.pop(); }, // It's okay if we pop an empty Vec // TODO Is this the best way to ignore the return value?
+			YamlPathElem::Root => ret.clear(),
+			_ => ret.push(elem.clone()), // TODO Is this clone necessary?
+		};
 	}
 	ret
 }
 
-fn yaml_get<'a>(yaml: &'a Yaml, context: &Vec<Vec<&str>>, path: &Vec<&str>) -> &'a Yaml { // TODO For these functions, should I be using &[&str], &Vec<&str>, &Vec<String>, ...?
-	let mut cur = yaml;
-	for elem in yaml_pathjoin(context).iter().chain(path.iter()) {
-		cur = if *elem == "" { yaml } else { &cur[*elem] }
+fn yaml_get<'a>(root: &'a Yaml, path: &YamlPath) -> &'a Yaml {
+	let mut cur = root;
+	let mut stack = vec![];
+	for elem in path.iter() {
+		cur = match elem {
+			YamlPathElem::DownObject(ref key) => { stack.push((elem, cur)); &cur[&key[..]] },
+			YamlPathElem::DownArray(key) => { stack.push((elem, cur)); &cur[*key as usize] },
+			YamlPathElem::Up => stack.pop().map(|x| x.1).unwrap_or(root),
+			YamlPathElem::Key => match stack.pop() {
+				None => &Yaml::BadValue,
+				_ => unimplemented!(), // TODO
+				//Some((YamlPathElem::DownObject(ref key), y)) => y.as_hash().unwrap().keys().find(|x| *x == &Yaml::String(key.to_string())).unwrap(), // TODO Clean up, fewer unwrap()s
+				//Some((YamlPathElem::DownObject(ref key), y)) => y.as_hash().unwrap().keys().find(|x| *x == &Yaml::(key))).unwrap(),
+				//Some((YamlPathElem::DownArray(key), y)) => y,
+				//_ => panic!("Inconsistent state: up, key, or root reference in canonicalized path"),
+			},
+			YamlPathElem::Root => root,
+		};
 	}
 	cur
 }
 
 fn yaml_bool(yaml: &Yaml) -> bool {
 	match yaml {
-		Yaml::BadValue | Yaml::Null | Yaml::Boolean(false) => false, // Should we also interpret 0, 0.0, and "" as falsy?
+		Yaml::BadValue | Yaml::Null | Yaml::Boolean(false) => false,
+		Yaml::Array(ref a) => ! a.is_empty(),
+		Yaml::Hash(ref h) => ! h.is_empty(),
 		_ => true,
 	}
 }
@@ -117,11 +150,61 @@ fn yaml_string(yaml: &Yaml) -> Result<String> {
 }
 
 #[derive(Debug)]
-struct Frame {
-	path: Vec<String>,
-	echo: bool,
-	loop_start: Option<usize>,
-	loop_idx: usize,
+pub enum Node {
+	Literal(String),
+	DirectSub(YamlPath),
+	CondSub(YamlPath, bool, Vec<Node>),
+}
+
+fn build_tree(tokens: &[Token]) -> (usize, Vec<Node>) {
+	let mut ret = vec![];
+	let mut i: usize = 0;
+	while i < tokens.len() {
+		match tokens[i] {
+			Token::Literal(ref s) => ret.push(Node::Literal(s.to_string())),
+			Token::DirectSub(ref path) => ret.push(Node::DirectSub(path.to_vec())), // TODO Can I do this without all the to_vec()s?
+			Token::CondSub(ref path) => {
+				let children = build_tree(&tokens[i+1..]);
+				ret.push(Node::CondSub(path.to_vec(), true, children.1));
+				i += children.0 + 1;
+			},
+			Token::InvSub(ref path) => { // TODO Decrease duplication between CondSub and InvSub
+				let children = build_tree(&tokens[i+1..]);
+				ret.push(Node::CondSub(path.to_vec(), false, children.1));
+				i += children.0 + 1;
+			},
+			Token::EndSub => break,
+			_ => (),
+		};
+		i += 1;
+	}
+	(i, ret)
+}
+
+fn render(values: &Yaml, tree: &[Node], context: &YamlPath) -> Result<String> {
+	let mut ret = "".to_string();
+	for node in tree {
+		let cur = match node {
+			Node::Literal(ref s) => s.to_string(),
+			Node::DirectSub(ref path) => yaml_string(yaml_get(values, &yaml_pathjoin(&vec![context, path][..]))).chain_err(|| "Couldn't stringify value")?,
+			Node::CondSub(ref path, direct, ref children) => {
+				//let abspath = &yaml_pathjoin(&vec![context, &path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()[..]]);
+				let abspath = &yaml_pathjoin(&vec![context, path][..]);
+				let target = yaml_get(values, abspath);
+				if yaml_bool(target) == *direct {
+					match target {
+						Yaml::Hash(ref contents) => contents.keys().map(|k| render(values, children, &yaml_pathjoin(&vec![abspath, &vec![YamlPathElem::DownObject(k.as_str().unwrap().to_string())]])).unwrap()).fold("".to_string(), |mut ret, cur| { ret.push_str(&cur); ret }),
+						Yaml::Array(ref contents) => (0..contents.len() as i64).into_iter().map(|i| render(values, children, &yaml_pathjoin(&vec![abspath, &vec![YamlPathElem::DownArray(i)]])).unwrap()).fold("".to_string(), |mut ret, cur| { ret.push_str(&cur); ret }),
+						// TODO Don't unwrap; don't use as_str() (this will require doing something about the non-string key case)
+						_ => render(values, children, abspath)?,
+					}
+				}
+				else { "".to_string() }
+			}
+		};
+		ret.push_str(&cur);
+	}
+	Ok(ret)
 }
 
 fn run() -> Result<()> {
@@ -134,38 +217,16 @@ fn run() -> Result<()> {
 	let input = read_file(args.value_of("input").unwrap()).chain_err(|| "Failed to get input")?;
 	let template = document(&input).expect("Failed to parse template"); // FIXME Why doesn't the borrow checker like this? .chain_err(|| "Failed to parse template")?;
 	let mut tokens = (template.1).1;
-	let yaml = (template.1).0;
 	tokens.push(Token::Literal(template.0.to_string())); // FIXME This hack will go away when I figure out how to make Nom parse all input
+	let tree = build_tree(&tokens).1;
+	let yaml = (template.1).0;
+	//println!("{:?}", yaml);
 	let values: Vec<Yaml> = args.value_of("values")
 		.map(|fname| yaml_rust::YamlLoader::load_from_str(&read_file(fname).expect("Failed to read values file")).expect("Failed to parse values file")) // FIXME Replace expects with chain_errs -- tricky inside closures
 		.or_else(|| yaml)
 		.ok_or(Error::from("Values are required either inline in the input or using the values flag"))?;
 	let values = &values[0]; // TODO What should we do if there are multiple streams in the file?  Ignore them?
-
-	let mut stack: Vec<Frame> = vec![];
-	let mut idx = 0;
-	while idx < tokens.len() {
-		//println!("\x1b[31m{:?} {:?}\x1b[m", token, stack);
-		let out: Result<String> = match &tokens[idx] {
-			Token::Literal(s) => Ok(s.to_string()),
-			Token::Comment(_) => Ok("".to_string()),
-			Token::DirectSub(ref path) => yaml_string(yaml_get(values, &stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect())), // TODO Abstract the ugly map to a function or something to minimize repeated code
-			Token::CondSub(ref path) => {
-				let echo = yaml_bool(yaml_get(values, &stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect()));
-				stack.push(Frame { path: path.to_vec(), echo: echo, loop_start: None, loop_idx: 0 });
-				Ok("".to_string())
-			},
-			Token::InvSub(ref path) => {
-				let echo = !yaml_bool(yaml_get(values, &stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>(), &path.iter().map(AsRef::as_ref).collect()));
-				stack.push(Frame { path: path.to_vec(), echo: echo, loop_start: None, loop_idx: 0 });
-				Ok("".to_string())
-			},
-			Token::EndSub => { stack.pop(); Ok("".to_string()) },
-			Token::KeySub(n) => Ok(yaml_pathjoin(&stack.iter().map(|x| x.path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()).collect::<Vec<Vec<&str>>>()).iter().rev().nth(*n as usize).map(|x| x.to_string()).ok_or(Error::from("Key level too high"))?),
-		};
-		print!("{}", if stack.iter().all(|x| x.echo) { out } else { Ok("".to_string()) }.chain_err(|| "Failed to template value")?);
-		idx += 1;
-	}
+	print!("{}", render(values, &tree, &vec![])?);
 	Ok(())
 }
 
