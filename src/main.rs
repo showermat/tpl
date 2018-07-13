@@ -18,23 +18,41 @@ use errors::*;
 // Allow comments to contain {{ and }} -- that is, do the nesting calculation for them as well
 // Error if there are unmatched conds (missing {{/}}s) rather than implicitly closing them at the end
 // User-friendly errors on template parsing failures
-// By default, print nothing if a variable cannot be found, but allow it to be configured to error
 // Allow text to be included after the / in EndSub.  Either ignore it or require it to match the start text
 // Options to collapse whitespace?
+// All the error messages need to be a lot nicer
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum YamlPathElem {
-	DownObject(String), // TODO Theoretically, we should support objects with keys other than strings
+	DownObject(String),
 	DownArray(i64),
 	Up,
-	Key,
 	Root
 }
 
 named!(yaml_path<&str, YamlPath>,
 	do_parse!(
-		path: ws!(pair!(opt!(char!('.')), separated_list!(char!('.'), ws!(nom::alphanumeric)))) >> // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
-		({ let mut ret = path.1.iter().map(|x| YamlPathElem::DownObject(x.to_string())).collect::<Vec<YamlPathElem>>(); if path.0.is_some() { ret.insert(0, YamlPathElem::Root); } ret  })
+		path: ws!(
+			pair!(
+				opt!(char!('.')),
+				separated_list!(
+					char!('.'),
+					ws!(
+						alt!(
+							do_parse!(n: recognize!(nom::digit) >> (YamlPathElem::DownArray(n.parse::<i64>().expect("Failed to parse digits as number")))) | // TODO Don't use expect, here or anywhere else
+							do_parse!(name: recognize!(nom::alphanumeric) >> (YamlPathElem::DownObject(name.to_string()))) |
+							do_parse!(tag_s!("&") >> (YamlPathElem::Up))
+						)
+					) // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
+				)
+			)
+		) >>
+		({
+			let mut ret = path.1;
+			if path.0.is_some() {
+				ret.insert(0, YamlPathElem::Root);
+			} ret
+		})
 	)
 );
 
@@ -47,6 +65,7 @@ pub enum Token {
 	CondSub(YamlPath),
 	InvSub(YamlPath),
 	EndSub,
+	KeySub(i64),
 	Comment(String),
 }
 
@@ -58,6 +77,7 @@ named!(template_sub<&str, Token>,
 			Some('#') => do_parse!(path: yaml_path >> (Token::CondSub(path))) |
 			Some('^') => do_parse!(path: yaml_path >> (Token::InvSub(path))) |
 			Some('/') => do_parse!((Token::EndSub)) | // FIXME How do I return Token::EndSub without this pointless do_parse?
+			Some('?') => do_parse!(n: opt!(nom::digit) >> (Token::KeySub(n.map(|x| x.parse::<i64>().expect("Failed to parse digits as number")).unwrap_or(0)))) |
 			Some('!') => do_parse!(text: take_until!("}}") >> (Token::Comment(text.to_string())))
 		),
 		tag_s!("}}")
@@ -112,17 +132,9 @@ fn yaml_get<'a>(root: &'a Yaml, path: &YamlPath) -> &'a Yaml {
 	let mut stack = vec![];
 	for elem in path.iter() {
 		cur = match elem {
-			YamlPathElem::DownObject(ref key) => { stack.push((elem, cur)); &cur[&key[..]] },
-			YamlPathElem::DownArray(key) => { stack.push((elem, cur)); &cur[*key as usize] },
-			YamlPathElem::Up => stack.pop().map(|x| x.1).unwrap_or(root),
-			YamlPathElem::Key => match stack.pop() {
-				None => &Yaml::BadValue,
-				_ => unimplemented!(), // TODO
-				//Some((YamlPathElem::DownObject(ref key), y)) => y.as_hash().unwrap().keys().find(|x| *x == &Yaml::String(key.to_string())).unwrap(), // TODO Clean up, fewer unwrap()s
-				//Some((YamlPathElem::DownObject(ref key), y)) => y.as_hash().unwrap().keys().find(|x| *x == &Yaml::(key))).unwrap(),
-				//Some((YamlPathElem::DownArray(key), y)) => y,
-				//_ => panic!("Inconsistent state: up, key, or root reference in canonicalized path"),
-			},
+			YamlPathElem::DownObject(ref key) => { stack.push(cur); &cur[&key[..]] },
+			YamlPathElem::DownArray(key) => { stack.push(cur); &cur[*key as usize] },
+			YamlPathElem::Up => stack.pop().unwrap_or(root),
 			YamlPathElem::Root => root,
 		};
 	}
@@ -145,6 +157,7 @@ fn yaml_string(yaml: &Yaml) -> Result<String> {
 		Yaml::String(x) => Ok(x.to_string()),
 		Yaml::Boolean(x) => Ok(x.to_string()),
 		Yaml::Null => Ok("".to_string()),
+		//_ => Ok("".to_string()), // TODO Make this behavior configurable
 		_ => Err(Error::from("Can't stringify type")), // TODO This error message (and a lot of others) needs to be better
 	}
 }
@@ -154,6 +167,7 @@ pub enum Node {
 	Literal(String),
 	DirectSub(YamlPath),
 	CondSub(YamlPath, bool, Vec<Node>),
+	KeySub(i64),
 }
 
 fn build_tree(tokens: &[Token]) -> (usize, Vec<Node>) {
@@ -173,6 +187,7 @@ fn build_tree(tokens: &[Token]) -> (usize, Vec<Node>) {
 				ret.push(Node::CondSub(path.to_vec(), false, children.1));
 				i += children.0 + 1;
 			},
+			Token::KeySub(n) => ret.push(Node::KeySub(n)),
 			Token::EndSub => break,
 			_ => (),
 		};
@@ -188,19 +203,26 @@ fn render(values: &Yaml, tree: &[Node], context: &YamlPath) -> Result<String> {
 			Node::Literal(ref s) => s.to_string(),
 			Node::DirectSub(ref path) => yaml_string(yaml_get(values, &yaml_pathjoin(&vec![context, path][..]))).chain_err(|| "Couldn't stringify value")?,
 			Node::CondSub(ref path, direct, ref children) => {
-				//let abspath = &yaml_pathjoin(&vec![context, &path.iter().map(AsRef::as_ref).collect::<Vec<&str>>()[..]]);
 				let abspath = &yaml_pathjoin(&vec![context, path][..]);
 				let target = yaml_get(values, abspath);
-				if yaml_bool(target) == *direct {
+				if yaml_bool(target) && *direct {
 					match target {
+						// TODO Don't unwrap; don't use as_str() (this will require doing something about the non-string key case); try to pull out common parts of these lines
 						Yaml::Hash(ref contents) => contents.keys().map(|k| render(values, children, &yaml_pathjoin(&vec![abspath, &vec![YamlPathElem::DownObject(k.as_str().unwrap().to_string())]])).unwrap()).fold("".to_string(), |mut ret, cur| { ret.push_str(&cur); ret }),
 						Yaml::Array(ref contents) => (0..contents.len() as i64).into_iter().map(|i| render(values, children, &yaml_pathjoin(&vec![abspath, &vec![YamlPathElem::DownArray(i)]])).unwrap()).fold("".to_string(), |mut ret, cur| { ret.push_str(&cur); ret }),
-						// TODO Don't unwrap; don't use as_str() (this will require doing something about the non-string key case)
 						_ => render(values, children, abspath)?,
 					}
 				}
+				else if ! yaml_bool(target) && ! *direct {
+					render(values, children, abspath)?
+				}
 				else { "".to_string() }
-			}
+			},
+			Node::KeySub(n) => match context.iter().rev().nth(*n as usize).ok_or(Error::from("No key in this context"))? {
+				YamlPathElem::DownObject(ref k) => k.to_string(),
+				YamlPathElem::DownArray(i) => i.to_string(),
+				_ => bail!("KeySub attempted on unexpected path element"),
+			},
 		};
 		ret.push_str(&cur);
 	}
@@ -220,7 +242,6 @@ fn run() -> Result<()> {
 	tokens.push(Token::Literal(template.0.to_string())); // FIXME This hack will go away when I figure out how to make Nom parse all input
 	let tree = build_tree(&tokens).1;
 	let yaml = (template.1).0;
-	//println!("{:?}", yaml);
 	let values: Vec<Yaml> = args.value_of("values")
 		.map(|fname| yaml_rust::YamlLoader::load_from_str(&read_file(fname).expect("Failed to read values file")).expect("Failed to parse values file")) // FIXME Replace expects with chain_errs -- tricky inside closures
 		.or_else(|| yaml)
