@@ -3,6 +3,8 @@ use ::yaml_rust;
 use ::yaml_rust::Yaml;
 use ::errors::*;
 
+const KEYCHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum YamlPathElem {
 	DownObject(String),
@@ -12,6 +14,15 @@ pub enum YamlPathElem {
 }
 
 pub type YamlPath = Vec<YamlPathElem>;
+
+/*pub fn path_str(p: &YamlPath) -> String { // TODO Surely this can be done more cleanly (less format!())
+	p.iter().map(|x| match x {
+		YamlPathElem::DownObject(ref s) => s.to_string(),
+		YamlPathElem::DownArray(n) => format!("{}", n),
+		YamlPathElem::Up => "&".to_string(),
+		YamlPathElem::Root => "".to_string(),
+	}).fold("".to_string(), |ret, cur| format!("{}.{}", ret, cur)) // FIXME Get rid of first "."
+}*/
 
 named!(yaml_path<&str, Result<YamlPath>>,
 	do_parse!(
@@ -23,7 +34,7 @@ named!(yaml_path<&str, Result<YamlPath>>,
 					ws!(
 						alt!(
 							do_parse!(n: recognize!(nom::digit) >> (n.parse::<i64>().map(|n| YamlPathElem::DownArray(n)).chain_err(|| "Failed to parse digits as number"))) |
-							do_parse!(name: recognize!(nom::alphanumeric) >> (Ok(YamlPathElem::DownObject(name.to_string())))) | // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
+							do_parse!(name: is_a!(KEYCHARS) >> (Ok(YamlPathElem::DownObject(name.to_string())))) | // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
 							do_parse!(tag_s!("&") >> (Ok(YamlPathElem::Up)))
 						)
 					)
@@ -74,21 +85,18 @@ named_args!(template_literal<'a>(open: &str) <&'a str, Result<Token>>,
 	)
 );
 
-named!(yaml_block<&str, Result<Vec<Yaml>>>,
-	do_parse!(
-		tag_s!("---\n") >>
-		block: take_until_and_consume!("\n...\n") >>
-		(yaml_rust::YamlLoader::load_from_str(&block).chain_err(|| "Failed to parse YAML block"))
+named!(yaml_block<&str, Option<Result<Vec<Yaml>>>>,
+	opt!(
+		do_parse!(
+			tag_s!("---\n") >>
+			block: take_until_and_consume!("\n...\n") >>
+			(yaml_rust::YamlLoader::load_from_str(&block).chain_err(|| "Failed to parse YAML block"))
+		)
 	)
 );
 
-named_args!(document<'a>(open: &str, close: &str) <&'a str, (Option<Result<Vec<Yaml>>>, Vec<Result<Token>>)>,
-	tuple!(
-		opt!(yaml_block),
-		many0!(
-			alt!(complete!(call!(template_sub, open, close)) | complete!(call!(template_literal, open)))
-		)
-	)
+named_args!(template<'a>(open: &str, close: &str) <&'a str, Vec<Result<Token>>>,
+	many0!(alt!(complete!(call!(template_sub, open, close)) | complete!(call!(template_literal, open))))
 );
 
 #[derive(Debug)]
@@ -125,17 +133,37 @@ fn build_tree(tokens: &[Token]) -> (usize, Vec<Node>) {
 	(i, ret)
 }
 
-pub fn parse_string(input: &str, open: &str, close: &str) -> Result<(Option<Vec<Yaml>>, Vec<Node>)> { // May change this to a tuple of results in the future
-	let template = match document(input, open, close) { //.expect("Failed to parse template"); // FIXME Probably because Nom's error type has some dependencies on the input document.  How do I deal with this? .chain_err(|| "Failed to parse template")?;
-		Ok(x) => x,
-		Err(e) => bail!(format!("Parsing failed with {:?}", e)), // Temporary patch
-	};
-	let mut tokens = (template.1).1.into_iter().collect::<Result<Vec<Token>>>()?;
-	tokens.push(Token::Literal(template.0.to_string())); // TODO This hack will go away when I figure out how to make Nom parse all input
-	let tree = build_tree(&tokens).1;
-	let yaml = match (template.1).0 { // TODO This feels like a hacky way of doing this
-		Some(x) => Some(x?),
-		None => None,
-	};
-	Ok((yaml, tree))
+#[derive(PartialEq)]
+enum ParsePhase { Start, PostYaml, Done }
+
+pub struct Parser {
+	remain: String,
+	state: ParsePhase,
+}
+
+impl Parser {
+	pub fn new(input: &str) -> Self {
+		Parser { remain: input.to_string(), state: ParsePhase::Start }
+	}
+	pub fn get_yaml(&mut self) -> Result<Option<Vec<Yaml>>> {
+		if self.state != ParsePhase::Start { bail!("YAML has already been retrieved"); }
+		self.state = ParsePhase::PostYaml;
+		match yaml_block(&self.remain.clone()) { // TODO Is this clone necessary?
+			Err(e) => bail!(format!("Parsing failed with {:?}", e)), // FIXME Can't chain_err, probably because Nom's error type is holding on to the input document.  How do I deal with this?
+			Ok((s, None)) => { self.remain = s.to_string(); Ok(None) },
+			Ok((s, Some(x))) => { let ret = x.chain_err(|| "Failed to parse input as YAML")?; self.remain = s.to_string(); Ok(Some(ret)) },
+		}
+	}
+	pub fn get_tpl(&mut self, open: &str, close: &str) -> Result<Vec<Node>> {
+		if self.state != ParsePhase::PostYaml { bail!("This must be done immediately after retrieving YAML"); }
+		self.state = ParsePhase::Done;
+		match template(&self.remain, open, close) {
+			Err(e) => bail!(format!("Parsing failed with {:?}", e)), // FIXME
+			Ok((s, tokens)) => {
+				let mut ret = tokens.into_iter().collect::<Result<Vec<Token>>>()?;
+				ret.push(Token::Literal(s.to_string()));
+				Ok(build_tree(&ret).1)
+			},
+		}
+	}
 }
