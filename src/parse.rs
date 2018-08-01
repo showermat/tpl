@@ -7,8 +7,7 @@ const KEYCHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum YamlPathElem {
-	DownObject(String),
-	DownArray(i64),
+	Down(String),
 	Up,
 	Root
 }
@@ -33,8 +32,7 @@ named!(yaml_path<&str, Result<YamlPath>>,
 					char!('.'),
 					ws!(
 						alt!(
-							do_parse!(n: recognize!(nom::digit) >> (n.parse::<i64>().map(|n| YamlPathElem::DownArray(n)).chain_err(|| "Failed to parse digits as number"))) |
-							do_parse!(name: is_a!(KEYCHARS) >> (Ok(YamlPathElem::DownObject(name.to_string())))) | // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
+							do_parse!(name: is_a!(KEYCHARS) >> (Ok(YamlPathElem::Down(name.to_string())))) | // FIXME YAML keys can consist of any character, properly escaped.  So we'll have to be more robust about this.
 							do_parse!(tag_s!("&") >> (Ok(YamlPathElem::Up)))
 						)
 					)
@@ -99,11 +97,11 @@ named_args!(template<'a>(open: &str, close: &str) <&'a str, Vec<Result<Token>>>,
 	many0!(alt!(complete!(call!(template_sub, open, close)) | complete!(call!(template_literal, open))))
 );
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Node {
 	Literal(String),
 	DirectSub(YamlPath),
-	CondSub(YamlPath, bool, Vec<Node>),
+	CondSub(YamlPath, bool, Vec<Node>), // Second argument false to invert the condition
 	KeySub(i64),
 }
 
@@ -155,7 +153,8 @@ impl Parser {
 		}
 	}
 	pub fn get_tpl(&mut self, open: &str, close: &str) -> Result<Vec<Node>> {
-		if self.state != ParsePhase::PostYaml { bail!("This must be done immediately after retrieving YAML"); }
+		if self.state == ParsePhase::Start { self.get_yaml()?; }
+		if self.state != ParsePhase::PostYaml { bail!("Template has already been retrieved"); }
 		self.state = ParsePhase::Done;
 		match template(&self.remain, open, close) {
 			Err(e) => bail!(format!("Parsing failed with {:?}", e)), // FIXME
@@ -165,5 +164,55 @@ impl Parser {
 				Ok(build_tree(&ret).1)
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	fn do_test(input: Vec<Token>, expected: Vec<Node>) {
+		assert_eq!(build_tree(&input), (input.len(), expected));
+	}
+	#[test]
+	fn build_tree_basic() {
+		do_test(vec![], vec![]);
+		do_test(
+			vec![
+				Token::Literal("a".to_string()),
+				Token::DirectSub(vec![YamlPathElem::Down("b".to_string())]),
+				Token::Comment("ignore me".to_string()),
+			],
+			vec![
+				Node::Literal("a".to_string()),
+				Node::DirectSub(vec![YamlPathElem::Down("b".to_string())]),
+			]
+		);
+	}
+	#[test]
+	fn build_tree_cond_sub() {
+		let path = vec![YamlPathElem::Down("a".to_string())];
+		do_test(
+			vec![
+				Token::CondSub(path.clone()),
+				Token::Literal("item: ".to_string()),
+				Token::DirectSub(vec![]),
+				Token::EndSub,
+				Token::InvSub(path.clone()),
+				Token::Literal("missing".to_string()),
+				Token::EndSub,
+			],
+			vec![
+				Node::CondSub(path.clone(), true, vec![Node::Literal("item: ".to_string()), Node::DirectSub(vec![])]),
+				Node::CondSub(path.clone(), false, vec![Node::Literal("missing".to_string())]),
+			]
+		);
+	}
+	#[test]
+	fn template_parse() {
+		use super::Parser;
+		let good = vec!["{}{x}", "{#}", "{#&.&.asd35_.__.342.x}", "{!-- }} -- } ((( --}"];
+		let bad = vec!["{{{", "{@}", "{&&}", "{??}", "{##}", "{#asd!}"];
+		for t in good { assert!(Parser::new(t).get_tpl("{", "}").is_ok()); }
+		for t in bad { assert!(Parser::new(t).get_tpl("{", "}").is_err()); }
 	}
 }
