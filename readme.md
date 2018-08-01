@@ -74,7 +74,7 @@ The template syntax is similar to that of [Mustache](https://mustache.github.io/
 ## Build and Run
 
 If you have the Rust toolchain installed, you can clone this repository and run `cargo build --install` as usual.  If you don't have
-Rust installed, you can download the binary from releases on GitHub.
+Rust installed, you can download the x86_64 binary from releases on GitHub.
 
 Run the program like:
 
